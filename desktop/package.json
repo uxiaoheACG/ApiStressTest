@@ -1,0 +1,63 @@
+{
+  "name": "ast-stress-desktop",
+  "version": "1.2.0",
+  "private": true,
+  "description": "API-STRESS-TEST 桌面端：ast 压测后端的图形界面",
+  "author": "API-STRESS-TEST",
+  "type": "module",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "dev:web": "vite --port 5173 --strictPort",
+    "dev:electron": "wait-on http://127.0.0.1:5173 && electron . --dev",
+    "dev": "concurrently -k -n VITE,APP -c cyan,magenta \"npm:dev:web\" \"npm:dev:electron\"",
+    "typecheck": "vue-tsc --noEmit",
+    "build": "vite build",
+    "start": "npm run build && electron .",
+    "pack": "npm run build && electron-builder --win --dir",
+    "dist": "npm run build && electron-builder --win"
+  },
+  "dependencies": {
+    "vue": "^3.5.44",
+    "vue-router": "^5.4.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^6.0.10",
+    "concurrently": "^10.0.6",
+    "electron": "^44.9.0",
+    "electron-builder": "^26.15.3",
+    "typescript": "~5.9",
+    "vite": "^8.3.4",
+    "vue-tsc": "^3.3.13",
+    "wait-on": "^9.5.1"
+  },
+  "build": {
+    "appId": "com.ast.stress.test",
+    "productName": "AST压测台",
+    "directories": {
+      "output": "release",
+      "buildResources": "resources"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "resources/backend",
+        "to": "backend"
+      }
+    ],
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "icon": "resources/icon.png"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "shortcutName": "AST压测台"
+    }
+  }
+}

@@ -1,0 +1,10 @@
+.idea
+.reasonix
+logo
+项目书
+
+ast/.idea
+ast/config_test
+ast/Data
+
+desktop/dist

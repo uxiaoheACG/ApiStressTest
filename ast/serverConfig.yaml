@@ -1,0 +1,17 @@
+# ast 服务器启动配置
+# 修改后需重启服务生效；环境变量可覆盖本文件（AST_PORT / GIN_MODE / AST_SHUTDOWN_TIMEOUT）
+
+# 监听地址：":3010" 表示监听所有网卡，也可写 "127.0.0.1:3010" 只允许本机访问
+addr: ":3010"
+
+# gin 运行模式：debug（默认，带调试输出）/ release（生产，日志更干净）/ test
+mode: "debug"
+
+# 读取请求头超时：超过该时间未收完请求头则断开连接，0 表示不限制
+readHeaderTimeout: "10s"
+
+# keep-alive 连接空闲超时：空闲超过该时间则关闭连接，0 表示不限制
+idleTimeout: "60s"
+
+# 收到退出信号（Ctrl+C）后，等待在途请求结束的最长时间，超时后强制关闭
+shutdownTimeout: "10s"
