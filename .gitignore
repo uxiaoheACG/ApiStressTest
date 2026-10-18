@@ -8,3 +8,5 @@ ast/config_test
 ast/Data
 
 desktop/dist
+desktop/node_modules
+desktop/release
