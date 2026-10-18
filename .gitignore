@@ -10,3 +10,12 @@ ast/Data
 desktop/dist
 desktop/node_modules
 desktop/release
+desktop/resources/backend
+
+# 日志与系统临时文件
+*.log
+Thumbs.db
+desktop.ini
+
+# 编辑器本地配置
+.vscode/
