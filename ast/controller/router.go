@@ -27,6 +27,10 @@ func RegisterRouter(r *gin.Engine) {
 	// 当次压测的完整参数（config_test/<jobID>.json），供历史页展示与重新测试
 	r.GET("/jobs/:id/config", funcs.TestConfig())
 
+	// 返回类型分析（任务目录下的 result.db）与类型样本
+	r.GET("/jobs/:id/analysis", funcs.Analysis())
+	r.GET("/jobs/:id/samples/:file", funcs.Sample())
+
 	// 历史任务查询（扫描 Data 目录，重启后仍可查）
 	r.GET("/history", funcs.History())
 }

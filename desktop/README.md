@@ -60,9 +60,44 @@ go build -trimpath -ldflags "-s -w" -o ../desktop/resources/backend/ast.exe .
 | **DELETE** | `/jobs/:id` | **新增**：取消正在执行的任务（202 = 信号已发出） |
 | **GET** | `/jobs/:id/records?kind=&offset=&limit=` | **新增**：分页读取 `success.jsonl` / `failures.jsonl` |
 | **GET** | `/jobs/:id/config` | **新增**：当次压测的完整参数（`config_test/<jobID>.json`） |
+| **GET** | `/jobs/:id/analysis` | **新增**：返回类型分析（任务目录下的 `result.db`） |
+| **GET** | `/jobs/:id/samples/:file` | **新增**：某个返回类型的样本原文 |
 
 `/jobs/:id/records` 的 `kind` 取 `success` / `failures`（默认），`limit` 上限 500、默认 100；
-数据直接来自磁盘，所以历史任务（进程重启后）也能看明细。
+**只对 1.3.0 之前的旧任务有效**——新版本不再按请求写 `success.jsonl` / `failures.jsonl`。
+
+## 结果存储：按「返回类型」聚合（1.3.0 起）
+
+压测热路径不再为每个请求写一行 JSON，而是先把结果归类成**指纹**：
+
+```
+指纹 = jobId | HTTP 状态码 | 业务码
+       业务码取自响应体（默认自动探测 code / errcode / errno / status 等字段，
+       也可在请求参数里用 bizCodeField 指定，如 "error.code"）
+       没有响应时（超时 / DNS / 连接拒绝）状态码记为 0，业务码位置放 err:<errKind>
+```
+
+每个指纹只落一行 SQLite 记录 + 一份样本文件，其余请求只把内存计数器 +1：
+
+```
+Data/<时间>_<jobID>/
+├── result.db          # SQLite：每种类型的计数、首次/末次出现时间、样本索引
+├── summary.json       # 汇总（QPS、分位数、状态码分布、类型数）
+└── samples/<hash>.json  # 每种类型的第一份完整请求/响应快照（响应体截断 4 KiB）
+```
+
+- **写入量是 O(返回类型数)**，不是 O(请求数)：1000 次请求通常只有几个类型、几十 KB
+- 所有类型的计数之和等于**实际完成的请求数**（`done`），取消任务时未执行的请求不计数
+- 业务码长度上限 64 字符（超长记为 `long`），单任务类型上限 5000（超出归入 `overflow`），
+  防止 traceId / 时间戳这类值把类型数撑爆
+- SQLite 用纯 Go 的 `modernc.org/sqlite`（`CGO_ENABLED=0` 可编译，Windows 无需 gcc），
+  单写协程独占连接 + WAL
+
+业务码字段路径存在请求参数里（`bizCodeField`），会随 `config_test` 存档一起保留，
+「重新测试」时自动带上。
+
+后端另外新增了 CORS 中间件（`service/cors.go`），只放行本机来源：`Origin` 为空、
+`null`（Electron 的 file:// 页面）、`localhost` / `127.0.0.1` / `::1` 的任意端口。
 
 **端口**：默认监听 `3010`（旧版是 8080），可用 `serverConfig.yaml` 的 `addr`
 或环境变量 `AST_PORT` 覆盖。
@@ -112,9 +147,10 @@ Vue 页面
   - multipart 可选本地文件，读成 base64 随配置提交，单文件 ≤ 10 MB
   - 支持从历史任务带参数跳转（`#/new?from=<jobID>`）自动填表
 - **任务详情**：实时进度与 QPS 趋势、`summary.json` 汇总、耗时分位（P50/P95/P99）、
-  状态码分布、明细分页表格（每页 100 条，点击行看完整请求/响应，凭证已由后端打码）；
-  **「当次请求参数」卡片**展示该次压测的 URL、方法、并发、Header、URL 参数、请求体与文件，
-  并提供 `↻ 重新测试` 一键带着这些参数跳到新建压测页。
+  状态码分布、**「返回类型分析」表格**（状态码 / 业务码 / 分类 / 错误归类 / 次数 / 占比 /
+  首次出现时间，点「查看」打开该类型的样本快照）；**「当次请求参数」卡片**展示该次压测的
+  URL、方法、并发、业务码字段、Header、URL 参数、请求体与文件，并提供 `↻ 重新测试`
+  一键带着这些参数跳到新建压测页。旧版本任务没有 `result.db`，仍展示原始的 jsonl 明细。
 - **历史记录**：扫描 `Data/*/summary.json`，可按任务 ID / 目录筛选，缺少 summary 的任务会标记。
 - **设置**：后端地址（持久化在 localStorage）、连接测试、内置后端启停、结果目录与打开按钮。
 
@@ -122,6 +158,9 @@ Vue 页面
 
 - `concurrency.rate`（每秒限速）后端尚未实现，界面标注为「不生效」。
 - 同时最多 4 个压测任务，超限返回 429；`/jobs` 只保留最近 50 条。
-- `saveData=0` 不产生明细文件，`saveData=2` 的成功记录只有简写（无请求/响应体）。
+- **`saveData` 参数已废弃**（1.3.0 起固定「每种返回类型存一份样本」）；旧配置里的该字段会被忽略。
+- 业务码只从响应体**前 4 KiB** 提取；响应体不是 JSON 或业务码在该范围之外时，退化为「只按状态码」归类。
+- 单个任务的返回类型上限 5000 种，超出后新类型归入 `overflow`；业务码超过 64 字符记为 `long`。
+- 所有类型的计数之和等于**已完成请求数**（`done`），取消任务时未执行的请求不计入。
 - 取消是协作式的：信号发出后任务要等在飞请求返回才变 `canceled`。
-- 结果目录里的 `success.jsonl` / `failures.jsonl` 是 NDJSON，不能整体 `JSON.parse`。
+- 1.3.0 之前的旧任务没有 `result.db`，只能看 `summary.json` 与旧的 jsonl 明细。

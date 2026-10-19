@@ -69,8 +69,10 @@ func FindDir(root, id string) (string, bool) {
 
 // LoadRecords 从任务目录里分页读取一类结果明细。
 //
+// 仅用于旧版本任务：新版本把结果按「返回类型」聚合进 result.db，
+// 不再写 success.jsonl / failures.jsonl。
 // kind 取 success（success.jsonl）或 failures/failure（failures.jsonl）。
-// 文件不存在时返回空列表 + Note，而不是错误——saveData=0 的任务本来就不落盘。
+// 文件不存在时返回空列表 + Note，而不是错误。
 // 非法 JSON 行（进程被强杀导致的半行）会被跳过，不参与分页。
 func LoadRecords(dir, kind string, offset, limit int) (RecordPage, error) {
 	fileName := FailureFileName
@@ -102,7 +104,7 @@ func LoadRecords(dir, kind string, offset, limit int) (RecordPage, error) {
 	f, err := os.Open(filepath.Join(dir, fileName))
 	if err != nil {
 		if os.IsNotExist(err) {
-			page.Note = "该任务没有生成 " + fileName + "（saveData 未开启落盘，或还没有这类记录）"
+			page.Note = "该任务没有生成 " + fileName + "（新版本任务不再按请求写明细文件，请查看类型分析）"
 			return page, nil
 		}
 		return page, fmt.Errorf("打开 %s 失败: %w", fileName, err)

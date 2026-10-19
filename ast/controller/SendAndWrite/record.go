@@ -18,21 +18,17 @@ const (
 	maxBodyBytes = 4 << 10
 )
 
-// successRecord 成功请求的简写记录（一行一条 NDJSON）
-type successRecord struct {
-	Index  int    `json:"i"`
-	Status int    `json:"s"`
-	Ms     int64  `json:"ms"`
-	Size   int64  `json:"size"`
-	At     string `json:"at"`
-}
-
-// failureRecord 失败/超时请求的详细记录（SaveData=3 时成功请求也用这个结构）
-type failureRecord struct {
-	Index   int    `json:"i"`
-	Kind    string `json:"kind"`              // unsuccess / timeout / error / success
-	ErrKind string `json:"errKind,omitempty"` // deadline / canceled / dns / tls / eof / refused / reset / other
-	Err     string `json:"err,omitempty"`
+// sampleFile 一种返回类型的样本（每个指纹只存一份，写到 samples/<hash>.json）。
+//
+// 以前的 success.jsonl / failures.jsonl 会为每个请求写一行；现在只保留每种
+// 返回类型的第一份完整样本，配合 SQLite 里的计数即可还原整体分布。
+type sampleFile struct {
+	Fingerprint string `json:"fingerprint"`
+	Kind        string `json:"kind"` // success / unsuccess / timeout / error
+	StatusCode  int    `json:"status"`
+	BizCode     string `json:"bizCode,omitempty"`
+	ErrKind     string `json:"errKind,omitempty"`
+	Err         string `json:"err,omitempty"`
 
 	Method string `json:"method"`
 	URL    string `json:"url"`
@@ -43,7 +39,6 @@ type failureRecord struct {
 	ReqBody          string            `json:"reqBody,omitempty"`
 	ReqBodyTruncated bool              `json:"reqBodyTruncated,omitempty"`
 
-	Status            int               `json:"status"`
 	RespHeader        map[string]string `json:"respHeader,omitempty"`
 	RespBody          string            `json:"respBody,omitempty"`
 	RespBodyTruncated bool              `json:"respBodyTruncated,omitempty"`
@@ -218,9 +213,9 @@ func readResponseBody(body io.Reader) (kept []byte, truncated bool, total int64,
 	return kept, truncated, total, err
 }
 
-// marshalLine 把记录序列化成一行（带结尾换行），失败返回 nil
-func marshalLine(v any) []byte {
-	data, err := json.Marshal(v)
+// marshalSample 把样本序列化成带缩进的 JSON（便于人工查看），失败返回 nil
+func marshalSample(sample sampleFile) []byte {
+	data, err := json.MarshalIndent(sample, "", "  ")
 	if err != nil {
 		return nil
 	}

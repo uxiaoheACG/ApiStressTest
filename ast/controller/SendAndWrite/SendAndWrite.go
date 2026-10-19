@@ -87,9 +87,10 @@ func run(ctx context.Context, cancel context.CancelFunc, j *job.Job, sink *Sink,
 			log.Printf("[job %s] %v", j.ID, runErr)
 		}
 
-		// 必须在所有 worker 退出后关闭：把剩余缓冲落盘并关闭文件
-		if err := sink.Close(); err != nil {
-			log.Printf("[job %s] 关闭结果文件失败: %v", j.ID, err)
+		// 必须在所有 worker 退出后关闭：落完剩余样本与计数，并写任务元信息
+		canceled := ctx.Err() != nil
+		if err := sink.Close(j.Snapshot().Progress.Done, canceled); err != nil {
+			log.Printf("[job %s] 收尾落库失败: %v", j.ID, err)
 			if runErr == nil {
 				runErr = err
 			}
@@ -101,20 +102,21 @@ func run(ctx context.Context, cancel context.CancelFunc, j *job.Job, sink *Sink,
 			return
 		}
 
-		sum := buildSummary(j, sink.Latencies())
+		sum := buildSummary(j, sink.Latencies(), sink.TypeCount())
 		if err := writeSummary(j.Dir, sum); err != nil {
 			log.Printf("[job %s] 写 %s 失败: %v", j.ID, job.SummaryFileName, err)
 		}
-		j.Complete(sum, ctx.Err() != nil)
+		j.Complete(sum, canceled)
 
-		log.Printf("[job %s] 压测结束（%s）：成功 %d，失败 %d（超时 %d / 非 2xx %d / 其它错误 %d），耗时 %dms，QPS %.1f，结果目录 %s",
-			j.ID, j.Snapshot().Status, sum.Success, sum.Failure, sum.Timeout, sum.Unsuccess, sum.Error, sum.ElapsedMs, sum.QPS, j.Dir)
+		log.Printf("[job %s] 压测结束（%s）：成功 %d，失败 %d（超时 %d / 非 2xx %d / 其它错误 %d），返回类型 %d 种，耗时 %dms，QPS %.1f，结果目录 %s",
+			j.ID, j.Snapshot().Status, sum.Success, sum.Failure, sum.Timeout, sum.Unsuccess, sum.Error,
+			sum.TypeCount, sum.ElapsedMs, sum.QPS, j.Dir)
 	}()
 
 	j.Start()
-	log.Printf("[job %s] 开始压测 %s %s：并发 %d，总请求 %d，超时 %dms，保存模式 %d，结果目录 %s",
+	log.Printf("[job %s] 开始压测 %s %s：并发 %d，总请求 %d，超时 %dms，业务码字段 %q，结果目录 %s",
 		j.ID, tmpl.Method, tmpl.URL.String(), cfg.Concurrency.Count, j.Total,
-		cfg.Concurrency.Timeout, cfg.SaveData, j.Dir)
+		cfg.Concurrency.Timeout, cfg.BizCodeField, j.Dir)
 
 	master.Run(ctx, j.Total, cfg.Concurrency.Count, func(ctx context.Context, i int) {
 		sink.Do(ctx, i, tmpl, snap, client)

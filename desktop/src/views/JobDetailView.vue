@@ -5,25 +5,42 @@ import CodeBars from '../components/CodeBars.vue'
 import LatencyBars from '../components/LatencyBars.vue'
 import RecordDetail from '../components/RecordDetail.vue'
 import RecordTable from '../components/RecordTable.vue'
+import SampleDrawer from '../components/SampleDrawer.vue'
 import Sparkline from '../components/Sparkline.vue'
 import {
   ApiError,
   cancelJob,
+  getAnalysis,
   getJob,
   getJobConfig,
+  getSample,
   listHistory,
   listRecords,
 } from '../api/client'
 import type {
+  AnalysisReport,
   HistoryEntry,
   JobSnapshot,
   MultipartBody,
   RecordKind,
   RecordLine,
   RecordPage,
+  SampleFile,
   TestConfig,
 } from '../api/types'
-import { formatBytes, formatMs, formatNumber, formatQps, formatTime, statusClass, statusText } from '../utils/format'
+import {
+  codeClass,
+  errKindText,
+  failureKindText,
+  formatBytes,
+  formatClock,
+  formatMs,
+  formatNumber,
+  formatQps,
+  formatTime,
+  statusClass,
+  statusText,
+} from '../utils/format'
 
 const route = useRoute()
 const router = useRouter()
@@ -51,6 +68,13 @@ const selected = ref<RecordLine | null>(null)
 const testConfig = ref<TestConfig | null>(null)
 const configLoading = ref(false)
 const configError = ref('')
+
+/** 返回类型分析（result.db）；旧版本任务没有该文件 */
+const analysisReport = ref<AnalysisReport | null>(null)
+const analysisLoading = ref(false)
+const analysisError = ref('')
+const sample = ref<SampleFile | null>(null)
+const sampleLoading = ref(false)
 
 let pollTimer: number | undefined
 
@@ -139,24 +163,69 @@ async function loadConfig() {
   }
 }
 
+/** 读取返回类型分析（任务目录下的 result.db）；旧版本任务 404 时静默降级 */
+async function loadAnalysis() {
+  analysisLoading.value = true
+  analysisError.value = ''
+  try {
+    const res = await getAnalysis(jobId.value)
+    analysisReport.value = res.report
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 404) {
+      analysisReport.value = null
+    } else {
+      analysisError.value = err instanceof ApiError ? err.message : (err as Error).message
+    }
+  } finally {
+    analysisLoading.value = false
+  }
+}
+
+/** 查看某个返回类型的样本 */
+async function viewSample(file: string) {
+  if (!file) return
+  sampleLoading.value = true
+  try {
+    sample.value = await getSample(jobId.value, file)
+  } catch (err) {
+    analysisError.value = err instanceof ApiError ? err.message : (err as Error).message
+  } finally {
+    sampleLoading.value = false
+  }
+}
+
+/** 所有类型命中次数之和（正常情况下等于已完成请求数） */
+const countSum = computed(() =>
+  (analysisReport.value?.types ?? []).reduce((sum, item) => sum + item.count, 0),
+)
+
+/** 次数占比，用于条形宽度 */
+function shareOf(count: number): number {
+  if (countSum.value <= 0) return 0
+  return (count / countSum.value) * 100
+}
+
+/** 分类 → 徽标样式 */
+function kindBadge(kind: string): string {
+  switch (kind) {
+    case 'success':
+      return 'badge badge-ok'
+    case 'timeout':
+      return 'badge badge-warn'
+    default:
+      return 'badge badge-err'
+  }
+}
+
 /** 把存档参数带回「新建压测」页，一键复现这次压测 */
 function retest() {
   void router.push({ path: '/new', query: { from: jobId.value } })
 }
 
-const saveDataText = computed(() => {
-  switch (testConfig.value?.saveData) {
-    case 0:
-      return '0 · 只统计（不写明细）'
-    case 1:
-      return '1 · 只存失败详情'
-    case 2:
-      return '2 · 成功简写 + 失败详情'
-    case 3:
-      return '3 · 全部详情'
-    default:
-      return '—'
-  }
+/** 业务码字段的展示文案 */
+const bizCodeFieldText = computed(() => {
+  const field = testConfig.value?.bizCodeField
+  return field ? field : '自动探测（code / errcode / errno / status）'
 })
 
 const authText = computed(() => {
@@ -220,7 +289,15 @@ const bodySummary = computed<{
 
 function startPolling() {
   stopPolling()
-  pollTimer = window.setInterval(fetchSnapshot, 1000)
+  let ticks = 0
+  pollTimer = window.setInterval(async () => {
+    await fetchSnapshot()
+    ticks += 1
+    // 运行中每 3 秒刷新一次类型分析，避免每次都查 SQLite
+    if (running.value && ticks % 3 === 0) {
+      await loadAnalysis()
+    }
+  }, 1000)
 }
 
 function stopPolling() {
@@ -271,6 +348,7 @@ onMounted(async () => {
   await fetchSnapshot()
   await loadRecords()
   await loadConfig()
+  await loadAnalysis()
   if (running.value) startPolling()
 })
 
@@ -377,8 +455,8 @@ onUnmounted(stopPolling)
             总请求 {{ formatNumber(testConfig.concurrency.totalRequests) }}
             <span v-if="testConfig.concurrency.rate"> · rate {{ testConfig.concurrency.rate }}</span>
           </dd>
-          <dt>结果落盘</dt>
-          <dd>{{ saveDataText }}</dd>
+          <dt>业务码字段</dt>
+          <dd>{{ bizCodeFieldText }}</dd>
           <dt>认证</dt>
           <dd>{{ authText }}</dd>
         </dl>
@@ -568,8 +646,99 @@ onUnmounted(stopPolling)
       </div>
     </section>
 
-    <!-- 明细 -->
+    <!-- 返回类型分析 -->
     <section class="card">
+      <div class="card-head">
+        <h2>返回类型分析</h2>
+        <div class="split" style="gap: 8px">
+          <span v-if="analysisLoading" class="spin" />
+          <span v-if="analysisReport" class="hint">
+            {{ analysisReport.typeCount }} 种类型 · 已完成
+            {{ formatNumber(analysisReport.done) }} 次
+          </span>
+          <button class="btn btn-sm" :disabled="analysisLoading" @click="loadAnalysis">
+            刷新
+          </button>
+        </div>
+      </div>
+
+      <div v-if="analysisError" class="banner banner-err" style="margin: 12px 16px">
+        <span>⚠️</span><span>{{ analysisError }}</span>
+      </div>
+
+      <template v-else-if="analysisReport">
+        <div v-if="analysisReport.types.length === 0" class="empty">
+          还没有数据（任务刚开始，或请求尚未返回）
+        </div>
+
+        <div v-else class="table-wrap">
+          <table class="table">
+            <thead>
+              <tr>
+                <th style="width: 84px">状态码</th>
+                <th style="width: 110px">业务码</th>
+                <th style="width: 96px">分类</th>
+                <th style="width: 96px">错误归类</th>
+                <th class="num" style="width: 78px">次数</th>
+                <th style="width: 170px">占比</th>
+                <th style="width: 92px">首次出现</th>
+                <th style="width: 72px">样本</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="item in analysisReport.types" :key="item.fingerprint">
+                <td>
+                  <span :class="codeClass(item.statusCode)">{{ item.statusCode || '—' }}</span>
+                </td>
+                <td class="mono-sm">{{ item.bizCode || '—' }}</td>
+                <td>
+                  <span :class="kindBadge(item.kind)">{{ failureKindText(item.kind) }}</span>
+                </td>
+                <td class="mono-sm dim">{{ item.errKind ? errKindText(item.errKind) : '—' }}</td>
+                <td class="num">{{ formatNumber(item.count) }}</td>
+                <td>
+                  <div class="share">
+                    <div class="share-bar">
+                      <div class="share-fill" :style="{ width: `${shareOf(item.count)}%` }" />
+                    </div>
+                    <span class="share-text">{{ shareOf(item.count).toFixed(1) }}%</span>
+                  </div>
+                </td>
+                <td class="mono-sm dim">{{ formatClock(item.firstSeenAt) }}</td>
+                <td>
+                  <button
+                    class="btn btn-ghost btn-sm"
+                    :disabled="!item.sampleFile || sampleLoading"
+                    @click="viewSample(item.sampleFile)"
+                  >
+                    查看
+                  </button>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="pager">
+          <span class="dim" style="font-size: 11.5px">
+            sum(次数) = {{ formatNumber(countSum) }} · 已完成
+            {{ formatNumber(analysisReport.done) }} 次；每种类型只保留一份样本（samples/ 目录）
+          </span>
+          <span
+            v-if="!running && countSum !== analysisReport.done"
+            class="badge badge-warn"
+          >计数与已完成数不一致</span>
+        </div>
+      </template>
+
+      <div v-else-if="!analysisLoading" class="empty">
+        <strong>这是旧版本任务</strong>
+        旧任务没有类型分析数据（result.db），下方展示的是按请求写入的原始明细文件。
+      </div>
+    </section>
+
+    <!-- 明细（仅旧版本任务有 jsonl 文件） -->
+    <section v-if="!analysisReport" class="card">
       <div class="card-head">
         <h2>结果明细</h2>
         <div class="split" style="gap: 8px">
@@ -620,6 +789,7 @@ onUnmounted(stopPolling)
     </section>
 
     <RecordDetail :line="selected" @close="selected = null" />
+    <SampleDrawer :sample="sample" @close="sample = null" />
   </div>
 </template>
 
@@ -649,5 +819,33 @@ onUnmounted(stopPolling)
   color: var(--accent);
   margin-left: 4px;
   font-size: 10.5px;
+}
+
+.share {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.share-bar {
+  flex: 1;
+  height: 8px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+
+.share-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, rgba(56, 189, 248, 0.9), rgba(52, 211, 153, 0.75));
+}
+
+.share-text {
+  font-size: 11.5px;
+  color: var(--muted);
+  min-width: 44px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
 }
 </style>

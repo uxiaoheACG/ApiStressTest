@@ -67,6 +67,8 @@ type Summary struct {
 	QPS         float64       `json:"qps"`
 	ElapsedMs   int64         `json:"elapsedMs"`
 	Latency     Latency       `json:"latency"`
+	// TypeCount 本次任务出现过的返回类型数（jobId + 状态码 + 业务码 去重后）
+	TypeCount int `json:"typeCount,omitempty"`
 }
 
 // Progress 任务的实时进度

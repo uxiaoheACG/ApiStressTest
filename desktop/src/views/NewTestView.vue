@@ -25,7 +25,8 @@ interface FileRow extends MultipartFilePayload {
 
 const url = ref('http://127.0.0.1:3010/')
 const method = ref('GET')
-const saveData = ref<0 | 1 | 2 | 3>(2)
+/** 业务码字段路径：留空时自动探测 code/errcode/errno 等，也可写 "error.code" 这类嵌套路径 */
+const bizCodeField = ref('')
 
 const bodyType = ref<BodyType>('json')
 const jsonText = ref('{\n  "hello": "world"\n}')
@@ -54,13 +55,6 @@ const notice = ref('')
 const sourceJob = ref('')
 
 const runningCount = computed(() => activeJobs(jobs.value).length)
-
-const saveDataOptions = [
-  { value: 0, label: '0 · 只统计', desc: '只生成 summary.json，不写明细' },
-  { value: 1, label: '1 · 只存失败', desc: '仅写 failures.jsonl 详细记录' },
-  { value: 2, label: '2 · 成功简写 + 失败详情', desc: '推荐：成功记一行简写，失败记详情' },
-  { value: 3, label: '3 · 全部详情', desc: '成功与失败都写请求/响应详情' },
-] as const
 
 const bodyTypes: Array<{ value: BodyType; label: string; hint: string }> = [
   { value: 'json', label: 'json', hint: 'application/json，保留字符串/数字/布尔类型' },
@@ -214,7 +208,6 @@ function buildConfig(): TestConfig {
   return {
     url: trimmedUrl,
     method: method.value,
-    saveData: saveData.value,
     body: { type: bodyType.value, data: bodyData },
     header: { ...header.value },
     params: { ...params.value },
@@ -225,6 +218,7 @@ function buildConfig(): TestConfig {
       totalRequests: Math.round(totalRequests.value),
       rate: Math.max(0, Math.round(rate.value || 0)),
     },
+    bizCodeField: bizCodeField.value.trim() || undefined,
   }
 }
 
@@ -246,7 +240,7 @@ function rememberConfig(config: TestConfig) {
 function applyConfig(conf: TestConfig) {
   url.value = conf.url ?? ''
   method.value = conf.method || 'GET'
-  saveData.value = (conf.saveData ?? 2) as 0 | 1 | 2 | 3
+  bizCodeField.value = conf.bizCodeField ?? ''
 
   const type = (conf.body?.type || 'json') as BodyType
   bodyType.value = type
@@ -559,10 +553,10 @@ onMounted(async () => {
       </section>
     </div>
 
-    <!-- 并发与落盘 -->
+    <!-- 并发与结果 -->
     <section class="card">
       <div class="card-head">
-        <h2>并发与落盘</h2>
+        <h2>并发与结果</h2>
         <span class="hint">后端同时最多运行 4 个任务</span>
       </div>
       <div class="card-body stack">
@@ -587,21 +581,18 @@ onMounted(async () => {
         </div>
 
         <div class="field">
-          <label>结果落盘</label>
-          <div class="save-options">
-            <label
-              v-for="opt in saveDataOptions"
-              :key="opt.value"
-              class="save-option"
-              :class="{ active: saveData === opt.value }"
-            >
-              <input v-model="saveData" type="radio" :value="opt.value" />
-              <span>
-                <strong>{{ opt.label }}</strong>
-                <em>{{ opt.desc }}</em>
-              </span>
-            </label>
-          </div>
+          <label for="bizCodeField">业务码字段（可选）</label>
+          <input
+            id="bizCodeField"
+            v-model="bizCodeField"
+            class="input"
+            placeholder="留空自动探测（code / errcode / errno / status），也可写 error.code"
+            spellcheck="false"
+          />
+          <span class="desc">
+            结果按「任务 ID + HTTP 状态码 + 业务码」归类：同一类只保留一份样本，其余只累加次数。
+            所有类型的次数之和等于实际完成的请求数（成功响应也会计数）。
+          </span>
         </div>
       </div>
     </section>
@@ -624,48 +615,6 @@ onMounted(async () => {
 </template>
 
 <style scoped>
-.save-options {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
-  gap: 9px;
-}
-
-.save-option {
-  display: flex;
-  gap: 9px;
-  align-items: flex-start;
-  padding: 10px 12px;
-  border-radius: var(--radius-sm);
-  border: 1px solid var(--border);
-  background: rgba(255, 255, 255, 0.025);
-  cursor: pointer;
-  transition: border-color 0.15s, background 0.15s;
-}
-
-.save-option.active {
-  border-color: rgba(56, 189, 248, 0.45);
-  background: rgba(56, 189, 248, 0.1);
-}
-
-.save-option input {
-  margin-top: 3px;
-  accent-color: var(--accent);
-}
-
-.save-option strong {
-  display: block;
-  font-size: 12.5px;
-  font-weight: 600;
-}
-
-.save-option em {
-  display: block;
-  font-style: normal;
-  font-size: 11.5px;
-  color: var(--dim);
-  margin-top: 2px;
-}
-
 .submit-bar {
   display: flex;
   align-items: center;

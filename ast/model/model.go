@@ -4,13 +4,16 @@ package model
 type TestConfig struct {
 	URL           string `json:"url" binding:"required,url"`
 	Method        string `json:"method" binding:"required"`
-	SaveData      int    `json:"saveData" binding:"oneof=0 1 2 3"`
 	SavePath      string `json:"savePath,omitempty"`
 	Body          RequestBody       `json:"body"`
 	Header        map[string]string `json:"header"`
 	Params        map[string]string `json:"params"`
 	Authorization Authorization     `json:"authorization"`
 	Concurrency   ConcurrencyConfig `json:"concurrency" binding:"required"`
+	// BizCodeField 业务码字段路径（如 "code"、"error.code"）；
+	// 留空时自动探测 code / errcode / errno / status 等常见字段，
+	// 用于把「HTTP 状态码 + 业务码」拼成返回类型指纹
+	BizCodeField string `json:"bizCodeField,omitempty"`
 }
 
 // RequestBody 请求体配置

@@ -2,18 +2,17 @@ package SendAndWrite
 
 import (
 	"context"
-	"io"
 	"net/http"
 	"time"
 
+	"ast/analysis"
 	"ast/job"
 )
 
-// failureInput 组装一条失败记录所需的全部信息
-type failureInput struct {
-	index     int
-	start     time.Time
-	kind      string // unsuccess / timeout / error / success
+// resultInput 一次请求的完整结果
+type resultInput struct {
+	kind      string // success / unsuccess / timeout / error
+	status    int
 	fail      job.FailureKind
 	err       error
 	snap      reqSnapshot
@@ -23,127 +22,119 @@ type failureInput struct {
 	truncated bool
 }
 
-// Do 发送一条请求，并按响应状态把结果写入 success.jsonl 或 failures.jsonl。
+// Do 发送一条请求，把结果按指纹归并到聚合器。
 //
-// 成功（2xx）只写简写记录；超时、其它网络错误、非 2xx 响应写详细记录（含请求快照与响应头体）。
-// 该方法可被任意多个 goroutine 并发调用：内部只做原子计数与 channel 投递，不直接操作文件。
+// 分类规则（与界面上的「返回类型」一致）：
+//
+//	2xx                    → success
+//	非 2xx（有响应）        → unsuccess
+//	err 且归类为 deadline   → timeout
+//	err 其它                → error
+//
+// 无论哪一类都会：读尽响应体（保证连接复用）→ 原子计数 → 内存指纹聚合；
+// 只有某一类首次出现时才序列化一份样本，因此热路径上没有 JSON 序列化与磁盘 IO。
+// 该方法可被任意多个 goroutine 并发调用。
 func (s *Sink) Do(ctx context.Context, index int, tmpl *http.Request, snap reqSnapshot, client *http.Client) {
 	start := time.Now()
 
 	req, err := deriveRequest(ctx, tmpl)
 	if err != nil {
-		s.recordFailure(failureInput{
-			index: index, start: start, kind: "error", fail: job.FailError, err: err, snap: snap,
+		s.finish(index, start, resultInput{
+			kind: analysis.KindError, fail: job.FailError, err: err, snap: snap,
 		})
 		return
 	}
 
 	resp, err := client.Do(req)
 	if err != nil {
-		kind, fail := "error", job.FailError
+		kind, fail := analysis.KindError, job.FailError
 		if errKindOf(err) == "deadline" {
-			kind, fail = "timeout", job.FailTimeout
+			kind, fail = analysis.KindTimeout, job.FailTimeout
 		}
-		s.recordFailure(failureInput{
-			index: index, start: start, kind: kind, fail: fail, err: err, snap: snap,
-		})
+		s.finish(index, start, resultInput{kind: kind, fail: fail, err: err, snap: snap})
 		return
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
-		s.recordSuccess(index, start, resp, snap)
-		return
+	// 不论状态码如何都保留响应体开头：成功要提取业务码，失败要存进样本；
+	// 剩余部分读尽以便复用连接
+	body, truncated, size, readErr := readResponseBody(resp.Body)
+
+	in := resultInput{
+		kind:      analysis.KindSuccess,
+		status:    resp.StatusCode,
+		snap:      snap,
+		resp:      resp,
+		body:      body,
+		size:      size,
+		truncated: truncated,
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		in.kind = analysis.KindUnsuccess
+		in.fail = job.FailUnsuccess
+		in.err = readErr
 	}
 
-	// 非 2xx：保留响应体开头部分用于详细记录，剩余读尽以便连接复用
-	body, truncated, size, readErr := readResponseBody(resp.Body)
-	s.recordFailure(failureInput{
-		index: index, start: start, kind: "unsuccess", fail: job.FailUnsuccess,
-		err: readErr, snap: snap, resp: resp, body: body, size: size, truncated: truncated,
+	s.finish(index, start, in)
+}
+
+// finish 计数、记录耗时，并按指纹聚合（首次出现时生成一份样本）
+func (s *Sink) finish(index int, start time.Time, in resultInput) {
+	ms := time.Since(start).Milliseconds()
+
+	if in.kind == analysis.KindSuccess {
+		s.j.AddSuccess(in.status)
+	} else {
+		s.j.AddFailure(in.fail, in.status)
+	}
+	s.setLatency(index, ms)
+
+	errKind := errKindOf(in.err)
+	bizCode := s.BizCode(in.body)
+
+	s.Record(HitInput{
+		StatusCode: in.status,
+		BizCode:    bizCode,
+		Kind:       in.kind,
+		ErrKind:    errKind,
+		ReqMethod:  in.snap.Method,
+		ReqURL:     in.snap.URL,
+		At:         start,
+	}, func(fingerprint, effectiveBiz string) []byte {
+		return marshalSample(s.buildSample(fingerprint, effectiveBiz, errKind, ms, start, in))
 	})
 }
 
-// recordSuccess 记录一次成功响应
-func (s *Sink) recordSuccess(index int, start time.Time, resp *http.Response, snap reqSnapshot) {
-	// SaveData=3：成功也写详细记录（含请求/响应体）
-	if s.detailSuccess() {
-		body, truncated, size, _ := readResponseBody(resp.Body)
-		ms := time.Since(start).Milliseconds()
-
-		s.j.AddSuccess(resp.StatusCode)
-		s.setLatency(index, ms)
-		s.Push(kindSuccess, marshalLine(s.detailedRecord(failureInput{
-			index: index, start: start, kind: "success", snap: snap,
-			resp: resp, body: body, size: size, truncated: truncated,
-		}, ms)))
-		return
-	}
-
-	// 其它模式：只需要字节数，读完即丢，保证连接可复用
-	size, _ := io.Copy(io.Discard, resp.Body)
-	ms := time.Since(start).Milliseconds()
-
-	s.j.AddSuccess(resp.StatusCode)
-	s.setLatency(index, ms)
-
-	if !s.needFile(kindSuccess) {
-		return
-	}
-	s.Push(kindSuccess, marshalLine(successRecord{
-		Index:  index,
-		Status: resp.StatusCode,
-		Ms:     ms,
-		Size:   size,
-		At:     recordTime(start),
-	}))
-}
-
-// recordFailure 记录一次失败/超时响应
-func (s *Sink) recordFailure(in failureInput) {
-	ms := time.Since(in.start).Milliseconds()
-
-	code := 0
-	if in.resp != nil {
-		code = in.resp.StatusCode
-	}
-	s.j.AddFailure(in.fail, code)
-	s.setLatency(in.index, ms)
-
-	if !s.needFile(kindFailure) {
-		return
-	}
-	s.Push(kindFailure, marshalLine(s.detailedRecord(in, ms)))
-}
-
-// detailedRecord 组装一条详细记录（失败/超时，以及 SaveData=3 时的成功）
-func (s *Sink) detailedRecord(in failureInput, ms int64) failureRecord {
-	rec := failureRecord{
-		Index:            in.index,
-		Kind:             in.kind,
-		ErrKind:          errKindOf(in.err),
-		Method:           in.snap.Method,
-		URL:              in.snap.URL,
-		At:               recordTime(in.start),
-		Ms:               ms,
-		ReqHeader:        in.snap.Header,
-		ReqBody:          in.snap.Body,
-		ReqBodyTruncated: in.snap.BodyTruncated,
-		RespBytes:        in.size,
+// buildSample 组装一份样本（只在该返回类型首次出现时调用）
+func (s *Sink) buildSample(
+	fingerprint, bizCode, errKind string, ms int64, at time.Time, in resultInput,
+) sampleFile {
+	sample := sampleFile{
+		Fingerprint:       fingerprint,
+		Kind:              in.kind,
+		StatusCode:        in.status,
+		BizCode:           bizCode,
+		ErrKind:           errKind,
+		Method:            in.snap.Method,
+		URL:               in.snap.URL,
+		At:                recordTime(at),
+		Ms:                ms,
+		ReqHeader:         in.snap.Header,
+		ReqBody:           in.snap.Body,
+		ReqBodyTruncated:  in.snap.BodyTruncated,
+		RespBytes:         in.size,
+		RespBodyTruncated: in.truncated,
 	}
 	if in.err != nil {
-		rec.Err = in.err.Error()
+		sample.Err = in.err.Error()
 	}
 	if in.resp != nil {
-		rec.Status = in.resp.StatusCode
-		rec.RespHeader = headerMap(in.resp.Header)
+		sample.RespHeader = headerMap(in.resp.Header)
 	}
 	if len(in.body) > 0 {
-		rec.RespBody = string(in.body)
+		sample.RespBody = string(in.body)
 	}
-	rec.RespBodyTruncated = in.truncated
-
-	return rec
+	return sample
 }
 
 // deriveRequest 从模板派生一条独立请求。

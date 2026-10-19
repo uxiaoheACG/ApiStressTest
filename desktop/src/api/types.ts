@@ -10,8 +10,6 @@ export type StatusCodes = Record<string, number>
 export interface TestConfig {
   url: string
   method: string
-  /** 0 只统计 / 1 只存失败 / 2 成功简写+失败详情 / 3 全部详情 */
-  saveData: 0 | 1 | 2 | 3
   body: {
     type: 'json' | 'form' | 'text' | 'raw' | 'multipart' | ''
     data: unknown
@@ -32,6 +30,8 @@ export interface TestConfig {
     /** 每秒发送请求数（后端暂未生效） */
     rate: number
   }
+  /** 业务码字段路径（如 "code"、"error.code"）；留空自动探测常见字段 */
+  bizCodeField?: string
 }
 
 /** multipart 里的一个文件字段，内容以 base64 传递 */
@@ -140,7 +140,7 @@ export interface StartedJob {
   dir: string
 }
 
-/** success.jsonl 里的一行：saveData=2 时是简写，3 时是详细结构 */
+/** 旧版本任务 success.jsonl 里的一行：saveData=2 时是简写，3 时是详细结构 */
 export interface SuccessRecordLine {
   i: number
   s: number
@@ -188,3 +188,51 @@ export interface RecordPage {
 
 /** 明细类型 */
 export type RecordKind = 'success' | 'failures'
+
+/** 一种返回类型的聚合统计（result.db 里的一行） */
+export interface AnalysisTypeStat {
+  fingerprint: string
+  statusCode: number
+  bizCode: string
+  kind: string
+  errKind: string
+  count: number
+  firstSeenAt: string
+  lastSeenAt: string
+  sampleFile: string
+  reqMethod: string
+  reqUrl: string
+}
+
+/** GET /jobs/:id/analysis 里 report 字段 */
+export interface AnalysisReport {
+  jobId: string
+  total: number
+  done: number
+  canceled: boolean
+  createdAt: string
+  finishedAt?: string
+  typeCount: number
+  types: AnalysisTypeStat[]
+}
+
+/** 样本文件内容（每种返回类型的第一份完整快照） */
+export interface SampleFile {
+  fingerprint: string
+  kind: string
+  status: number
+  bizCode?: string
+  errKind?: string
+  err?: string
+  method: string
+  url: string
+  at: string
+  ms: number
+  reqHeader?: Record<string, string>
+  reqBody?: string
+  reqBodyTruncated?: boolean
+  respHeader?: Record<string, string>
+  respBody?: string
+  respBodyTruncated?: boolean
+  respBytes: number
+}

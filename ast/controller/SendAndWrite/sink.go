@@ -1,7 +1,7 @@
 package SendAndWrite
 
 import (
-	"bufio"
+	"database/sql"
 	"errors"
 	"fmt"
 	"os"
@@ -10,63 +10,50 @@ import (
 	"sync/atomic"
 	"time"
 
+	"ast/analysis"
 	"ast/job"
 	"ast/model"
 )
 
-// resultKind 结果文件的类别，同时用作 resultFiles 的下标
-type resultKind int
-
 const (
-	kindSuccess resultKind = iota // 成功响应（success.jsonl）
-	kindFailure                   // 失败/超时响应（failures.jsonl）
-	kindCount                     // 类别总数
-)
+	// samplesDirName 任务目录下存放「每种返回类型一份样本」的子目录
+	samplesDirName = "samples"
 
-// resultFiles 各个结果文件名
-var resultFiles = [kindCount]string{"success.jsonl", "failures.jsonl"}
+	// flushInterval 计数回写间隔：低速任务也能在界面上看到最新次数
+	flushInterval = time.Second
 
-const (
-	// bufSize 每个结果文件的写缓冲大小
-	bufSize = 256 << 10
+	// sampleChanCap 样本事件队列容量（只承载「新类型」，数量级等于类型数）
+	sampleChanCap = 256
 
-	// flushThreshold 缓冲累积到该字节数就主动落盘
-	flushThreshold = 64 << 10
-
-	// flushInterval 兜底落盘间隔：低速率时也能及时把数据写到磁盘，方便 tail -f
-	flushInterval = 200 * time.Millisecond
-
-	// chanFactor / chanMin / chanMax 结果 channel 容量：min(chanFactor*并发数, chanMax)，下限 chanMin
-	chanFactor = 4
-	chanMin    = 1024
-	chanMax    = 65536
-
-	// maxLatencySamples 最多收集多少个请求的耗时用于算分位数；超过则放弃分位统计（不额外占内存）
+	// maxLatencySamples 最多收集多少个请求的耗时用于算分位数；超过则放弃分位统计
 	maxLatencySamples = 5_000_000
 )
 
-// record 一条待落盘记录（line 已包含结尾换行）
-type record struct {
-	kind resultKind
-	line []byte
+// sampleEvent 一个新出现的返回类型：样本内容 + 落库元信息
+type sampleEvent struct {
+	stat   analysis.TypeStat
+	sample []byte
 }
 
-// Sink 单个任务的结果落盘器。
+// Sink 单个任务的结果聚合与落库器。
 //
-// 并发模型：任意数量的 worker 调用 Push 投递已序列化的一行数据，由唯一的写协程
-// 用 bufio 批量写入文件。因此热路径上没有锁、每次请求也不产生系统调用，
-// 磁盘写入被合并成大块，压测吞吐不受落盘影响。
+// 与旧实现（每个请求写一行 jsonl）的区别：
+//   - 热路径只做内存计数（Aggregator），不序列化、不碰磁盘
+//   - 每个新出现的返回类型投递一次样本事件，由唯一的写协程落样本 + 写 SQLite
+//   - 任务结束时把最终计数批量回写 SQLite（写入量是 O(类型数)，不是 O(请求数)）
 //
 // 生命周期：Close 必须在所有 worker 退出后调用（由 master.Run 的等待保证）。
 type Sink struct {
-	j        *job.Job
-	saveMode int
-	active   bool
+	j      *job.Job
+	jobDir string
 
-	files [kindCount]*os.File
-	bufs  [kindCount]*bufio.Writer
+	bizCodeField string
+	agg          *Aggregator
 
-	ch   chan record
+	db     *sql.DB
+	writer *analysis.Writer
+
+	ch   chan sampleEvent
 	stop chan struct{}
 	done chan struct{}
 
@@ -80,63 +67,155 @@ type Sink struct {
 	errMsg atomic.Pointer[string]
 }
 
-// NewSink 为任务创建结果文件并启动写协程。
-//
-// saveMode 对应 TestConfig.SaveData：
-//
-//	0 只统计不落盘 | 1 只写失败详情 | 2 成功简写 + 失败详情 | 3 成功失败都写详情
+// NewSink 准备任务目录、样本目录与分析数据库，并启动写协程。
 func NewSink(j *job.Job, cfg model.TestConfig) (*Sink, error) {
 	s := &Sink{
-		j:        j,
-		saveMode: cfg.SaveData,
-		ch:       make(chan record, chanCap(cfg.Concurrency.Count)),
-		stop:     make(chan struct{}),
-		done:     make(chan struct{}),
+		j:            j,
+		jobDir:       j.Dir,
+		bizCodeField: cfg.BizCodeField,
+		agg:          NewAggregator(j.ID),
+		ch:           make(chan sampleEvent, sampleChanCap),
+		stop:         make(chan struct{}),
+		done:         make(chan struct{}),
 	}
 	s.initLatency(j.Total)
 
-	for k := kindSuccess; k < kindCount; k++ {
-		if !s.needFile(k) {
-			continue
-		}
-		path := filepath.Join(j.Dir, resultFiles[k])
-		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-		if err != nil {
-			_ = s.closeFiles()
-			return nil, fmt.Errorf("创建结果文件 %s 失败: %w", resultFiles[k], err)
-		}
-		s.files[k] = f
-		s.bufs[k] = bufio.NewWriterSize(f, bufSize)
+	if err := os.MkdirAll(filepath.Join(j.Dir, samplesDirName), 0o755); err != nil {
+		return nil, fmt.Errorf("创建样本目录失败: %w", err)
 	}
 
-	s.active = s.bufs[kindSuccess] != nil || s.bufs[kindFailure] != nil
-	if s.active {
-		go s.loop()
-	} else {
-		// 不落盘（saveMode=0）时没有写协程，done 直接关闭，Close 不会阻塞
-		close(s.done)
+	db, err := analysis.Open(j.Dir)
+	if err != nil {
+		return nil, err
+	}
+	s.db = db
+	s.writer = analysis.NewWriter(db, j.ID)
+	if err := s.writer.InitMeta(j.Total, j.CreatedAt()); err != nil {
+		_ = db.Close()
+		return nil, err
 	}
 
+	go s.loop()
 	return s, nil
 }
 
-// Push 投递一条已序列化的记录。Sink 已关闭或不需要落盘时直接丢弃，不会阻塞调用方。
-func (s *Sink) Push(kind resultKind, line []byte) {
-	if !s.active || len(line) == 0 {
+// Record 记录一次请求结果。
+//
+// 先做内存计数；只有该返回类型首次出现时才调用 buildSample 生成样本，
+// 避免每个请求都做 JSON 序列化。buildSample 收到的 bizCode 是实际参与指纹的值
+// （类型过多时可能被改写为 overflow）。
+func (s *Sink) Record(in HitInput, buildSample func(fingerprint, bizCode string) []byte) {
+	hit := s.agg.Hit(in)
+	if !hit.First {
 		return
 	}
+
+	sample := buildSample(hit.Fingerprint, hit.BizCode)
+	if len(sample) == 0 {
+		return
+	}
+
+	ev := sampleEvent{
+		stat: analysis.TypeStat{
+			Fingerprint: hit.Fingerprint,
+			StatusCode:  in.StatusCode,
+			BizCode:     hit.BizCode,
+			Kind:        in.Kind,
+			ErrKind:     in.ErrKind,
+			FirstSeenAt: recordTime(in.At),
+			LastSeenAt:  recordTime(in.At),
+			SampleFile:  sampleFileName(hit.Fingerprint),
+			ReqMethod:   in.ReqMethod,
+			ReqURL:      in.ReqURL,
+		},
+		sample: sample,
+	}
+
 	select {
-	case s.ch <- record{kind: kind, line: line}:
+	case s.ch <- ev:
 	case <-s.stop:
 	}
 }
 
-// Close 停止写协程、把缓冲落盘并关闭文件。必须在所有 worker 退出后调用，可重复调用。
-func (s *Sink) Close() error {
+// BizCode 按任务配置的字段路径从响应体提取业务码
+func (s *Sink) BizCode(body []byte) string {
+	return ExtractBizCode(body, s.bizCodeField)
+}
+
+// loop 唯一的写协程：处理新类型事件，并按固定间隔回写计数
+func (s *Sink) loop() {
+	defer close(s.done)
+
+	ticker := time.NewTicker(flushInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case ev := <-s.ch:
+			s.writeType(ev)
+		case <-ticker.C:
+			s.flushCounts()
+		case <-s.stop:
+			s.drain()
+			return
+		}
+	}
+}
+
+// drain 处理完队列里剩余的新类型事件，并做最后一次计数回写
+func (s *Sink) drain() {
+	for {
+		select {
+		case ev := <-s.ch:
+			s.writeType(ev)
+		default:
+			s.flushCounts()
+			return
+		}
+	}
+}
+
+// writeType 落一份样本文件 + 写一条类型记录
+func (s *Sink) writeType(ev sampleEvent) {
+	path := filepath.Join(s.jobDir, samplesDirName, ev.stat.SampleFile)
+	if err := os.WriteFile(path, ev.sample, 0o644); err != nil {
+		s.setErr(fmt.Errorf("写入样本 %s 失败: %w", ev.stat.SampleFile, err))
+		ev.stat.SampleFile = "" // 文件没写成，库里不留假路径
+	}
+	if err := s.writer.InsertType(ev.stat); err != nil {
+		s.setErr(err)
+	}
+}
+
+// flushCounts 把内存里的计数批量回写 SQLite
+func (s *Sink) flushCounts() {
+	items := s.agg.Snapshot()
+	updates := make([]analysis.CountUpdate, 0, len(items))
+	for _, item := range items {
+		updates = append(updates, analysis.CountUpdate{
+			Fingerprint: item.Fingerprint,
+			Count:       item.Count,
+			LastSeen:    item.LastSeen,
+		})
+	}
+	if err := s.writer.UpdateCounts(updates); err != nil {
+		s.setErr(err)
+	}
+}
+
+// Close 收尾：停止写协程、落完剩余样本与计数、写任务元信息、关闭数据库。
+// 必须在所有 worker 退出之后调用，可重复调用。
+func (s *Sink) Close(done int64, canceled bool) error {
 	s.closeOnce.Do(func() {
 		close(s.stop)
 		<-s.done
-		s.closeErr = s.closeFiles()
+
+		if err := s.writer.Finish(done, canceled); err != nil {
+			s.closeErr = err
+		}
+		if err := s.db.Close(); err != nil && s.closeErr == nil {
+			s.closeErr = fmt.Errorf("关闭分析数据库失败: %w", err)
+		}
 		if err := s.Err(); err != nil && s.closeErr == nil {
 			s.closeErr = err
 		}
@@ -144,7 +223,7 @@ func (s *Sink) Close() error {
 	return s.closeErr
 }
 
-// Err 返回首个写盘错误，没有则返回 nil
+// Err 返回首个落库错误，没有则返回 nil
 func (s *Sink) Err() error {
 	if p := s.errMsg.Load(); p != nil {
 		return errors.New(*p)
@@ -156,117 +235,8 @@ func (s *Sink) Err() error {
 // 只能在所有 worker 退出后读取。
 func (s *Sink) Latencies() []int64 { return s.latency }
 
-// loop 唯一的写协程：从 channel 取记录写入 bufio，按阈值或定时落盘
-func (s *Sink) loop() {
-	defer close(s.done)
-
-	ticker := time.NewTicker(flushInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case rec := <-s.ch:
-			s.write(rec)
-		case <-ticker.C:
-			s.flushAll()
-		case <-s.stop:
-			s.drain()
-			s.flushAll()
-			return
-		}
-	}
-}
-
-// drain 把 channel 里剩余的记录写空
-func (s *Sink) drain() {
-	for {
-		select {
-		case rec := <-s.ch:
-			s.write(rec)
-		default:
-			return
-		}
-	}
-}
-
-// write 把一行记录写入对应文件的缓冲，缓冲到阈值时落盘
-func (s *Sink) write(rec record) {
-	if rec.kind < 0 || rec.kind >= kindCount {
-		return
-	}
-	buf := s.bufs[rec.kind]
-	if buf == nil {
-		return
-	}
-	if _, err := buf.Write(rec.line); err != nil {
-		s.setErr(err)
-		return
-	}
-	if buf.Buffered() >= flushThreshold {
-		if err := buf.Flush(); err != nil {
-			s.setErr(err)
-		}
-	}
-}
-
-// flushAll 把所有缓冲落盘
-func (s *Sink) flushAll() {
-	for k := kindSuccess; k < kindCount; k++ {
-		if s.bufs[k] == nil {
-			continue
-		}
-		if err := s.bufs[k].Flush(); err != nil {
-			s.setErr(err)
-		}
-	}
-}
-
-// closeFiles 落盘、Sync 并关闭所有文件，返回首个错误
-func (s *Sink) closeFiles() error {
-	var first error
-	s.flushAll()
-	for k := kindSuccess; k < kindCount; k++ {
-		f := s.files[k]
-		if f == nil {
-			continue
-		}
-		if err := f.Sync(); err != nil && first == nil {
-			first = err
-		}
-		if err := f.Close(); err != nil && first == nil {
-			first = err
-		}
-		s.files[k] = nil
-		s.bufs[k] = nil
-	}
-	return first
-}
-
-// setErr 记录首个写盘错误
-func (s *Sink) setErr(err error) {
-	if err == nil {
-		return
-	}
-	msg := err.Error()
-	s.errMsg.CompareAndSwap(nil, &msg)
-}
-
-// needFile 判断当前保存模式是否需要写该类结果文件
-func (s *Sink) needFile(kind resultKind) bool {
-	switch s.saveMode {
-	case 0: // 只统计
-		return false
-	case 1: // 只写失败
-		return kind == kindFailure
-	default: // 2 / 3 以及未识别的取值，都写
-		return true
-	}
-}
-
-// detailSuccess 成功请求是否也写详细记录（SaveData=3）
-func (s *Sink) detailSuccess() bool {
-	return s.saveMode == 3
-}
+// TypeCount 当前已出现的返回类型数（供实时展示）
+func (s *Sink) TypeCount() int64 { return s.agg.TypeCount() }
 
 // initLatency 预分配耗时收集切片；请求数过大时放弃分位统计，避免占用过多内存
 func (s *Sink) initLatency(total int) {
@@ -287,14 +257,11 @@ func (s *Sink) setLatency(index int, ms int64) {
 	s.latency[index] = ms
 }
 
-// chanCap 计算结果 channel 容量
-func chanCap(count int) int {
-	n := count * chanFactor
-	if n < chanMin {
-		n = chanMin
+// setErr 记录首个落库错误
+func (s *Sink) setErr(err error) {
+	if err == nil {
+		return
 	}
-	if n > chanMax {
-		n = chanMax
-	}
-	return n
+	msg := err.Error()
+	s.errMsg.CompareAndSwap(nil, &msg)
 }

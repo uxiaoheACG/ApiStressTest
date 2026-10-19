@@ -10,8 +10,9 @@ import (
 )
 
 // buildSummary 汇总任务统计。latencies 中 -1 表示该序号未执行（任务被取消）。
+// typeCount 是本次出现过的返回类型数（由 Sink 的指纹聚合得出）。
 // 只能在所有 worker 退出后调用。
-func buildSummary(j *job.Job, latencies []int64) *job.Summary {
+func buildSummary(j *job.Job, latencies []int64, typeCount int64) *job.Summary {
 	snap := j.Snapshot()
 
 	samples := make([]int64, 0, len(latencies))
@@ -34,6 +35,7 @@ func buildSummary(j *job.Job, latencies []int64) *job.Summary {
 		QPS:         snap.Progress.QPS,
 		ElapsedMs:   snap.ElapsedMs,
 		Latency:     latencyStat(samples),
+		TypeCount:   int(typeCount),
 	}
 }
 

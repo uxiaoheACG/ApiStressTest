@@ -1,8 +1,10 @@
 import type {
+  AnalysisReport,
   HistoryEntry,
   JobSnapshot,
   RecordKind,
   RecordPage,
+  SampleFile,
   StartResult,
   TestConfig,
 } from './types'
@@ -153,4 +155,16 @@ export function getJobConfig(
   id: string,
 ): Promise<{ code: number; jobId: string; config: TestConfig }> {
   return request('GET', `/jobs/${encodeURIComponent(id)}/config`)
+}
+
+/** 返回类型分析（任务目录下的 result.db）；旧版本任务返回 404 */
+export function getAnalysis(
+  id: string,
+): Promise<{ code: number; jobId: string; dir: string; report: AnalysisReport }> {
+  return request('GET', `/jobs/${encodeURIComponent(id)}/analysis`)
+}
+
+/** 某个返回类型的样本原文 */
+export function getSample(id: string, file: string): Promise<SampleFile> {
+  return request('GET', `/jobs/${encodeURIComponent(id)}/samples/${encodeURIComponent(file)}`)
 }
