@@ -8,11 +8,7 @@ const route = useRoute()
 const online = ref<boolean | null>(null)
 const lastError = ref('')
 const baseUrl = ref(getBaseUrl())
-const checking = ref(false)
-/** 手动检测后的短暂结果提示：ok / err，2.5 秒后自动清空 */
-const flash = ref<'' | 'ok' | 'err'>('')
 let timer: number | undefined
-let flashTimer: number | undefined
 /** 当前轮询间隔：离线时缩短，后端刚启动也能很快连上 */
 let intervalMs = 6000
 
@@ -30,9 +26,8 @@ const subtitle = computed(() => {
   return '后端未连接 · 请在设置页确认地址或启动后端'
 })
 
-async function check(manual = false) {
+async function check() {
   baseUrl.value = getBaseUrl()
-  checking.value = true
   try {
     const res = await health()
     online.value = res.status === 'OK'
@@ -41,15 +36,6 @@ async function check(manual = false) {
     online.value = false
     lastError.value = (err as Error).message
   } finally {
-    checking.value = false
-    // 只有手动点击才给“已连接 / 连接失败”的短暂反馈，自动轮询不打扰
-    if (manual) {
-      flash.value = online.value ? 'ok' : 'err'
-      if (flashTimer) window.clearTimeout(flashTimer)
-      flashTimer = window.setTimeout(() => {
-        flash.value = ''
-      }, 2500)
-    }
     // 离线时 2.5 秒重试一次（后端可能正在启动），在线时回到 6 秒
     startTimer(online.value ? 6000 : 2500)
   }
@@ -63,11 +49,6 @@ function startTimer(ms: number) {
   timer = window.setInterval(check, ms)
 }
 
-/** 顶部「重新检测」按钮：手动检测一次 */
-function checkNow() {
-  void check(true)
-}
-
 onMounted(() => {
   void check()
   startTimer(6000)
@@ -75,7 +56,6 @@ onMounted(() => {
 
 onUnmounted(() => {
   if (timer) window.clearInterval(timer)
-  if (flashTimer) window.clearTimeout(flashTimer)
 })
 </script>
 
@@ -122,24 +102,6 @@ onUnmounted(() => {
         </div>
         <div class="topbar-actions">
           <RouterLink to="/new" class="btn btn-primary btn-sm">＋ 新建压测</RouterLink>
-          <button
-            class="btn btn-sm detect-btn"
-            :class="{ 'btn-flash-ok': flash === 'ok', 'btn-flash-err': flash === 'err' }"
-            :disabled="checking"
-            :title="lastError || '立即重新检测后端连接'"
-            @click="checkNow"
-          >
-            <span v-if="checking" class="spin" />
-            {{
-              checking
-                ? '检测中…'
-                : flash === 'ok'
-                  ? '✓ 已连接'
-                  : flash === 'err'
-                    ? '✕ 连接失败'
-                    : '重新检测'
-            }}
-          </button>
         </div>
       </header>
 
@@ -169,22 +131,6 @@ onUnmounted(() => {
   margin-right: 5px;
   background: var(--dim);
   vertical-align: middle;
-}
-
-.detect-btn {
-  min-width: 104px;
-}
-
-.btn-flash-ok {
-  background: var(--ok-soft);
-  border-color: rgba(52, 211, 153, 0.45);
-  color: #6ee7b7;
-}
-
-.btn-flash-err {
-  background: var(--err-soft);
-  border-color: rgba(248, 113, 113, 0.45);
-  color: #fca5a5;
 }
 
 .dot-ok {

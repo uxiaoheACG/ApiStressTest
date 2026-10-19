@@ -31,6 +31,10 @@ func RegisterRouter(r *gin.Engine) {
 	r.GET("/jobs/:id/analysis", funcs.Analysis())
 	r.GET("/jobs/:id/samples/:file", funcs.Sample())
 
+	// 删除任务记录（?purge=true 时连同 Data 目录与 config_test 存档一起删除）
+	// 注意：上面的 DELETE /jobs/:id 是「取消运行中的任务」，这里才是「删除记录」
+	r.DELETE("/jobs/:id/record", funcs.DeleteJobRecord())
+
 	// 历史任务查询（扫描 Data 目录，重启后仍可查）
 	r.GET("/history", funcs.History())
 }

@@ -95,6 +95,18 @@ func (s *Store) List() []*Job {
 	return list
 }
 
+// Remove 从内存注册表移除任务（不删除磁盘数据）。返回是否真的移除了。
+func (s *Store) Remove(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.jobs[id]; !ok {
+		return false
+	}
+	delete(s.jobs, id)
+	return true
+}
+
 // RunningCount 返回仍在执行的任务数
 func (s *Store) RunningCount() int {
 	s.mu.RLock()

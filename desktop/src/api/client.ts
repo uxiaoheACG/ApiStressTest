@@ -168,3 +168,23 @@ export function getAnalysis(
 export function getSample(id: string, file: string): Promise<SampleFile> {
   return request('GET', `/jobs/${encodeURIComponent(id)}/samples/${encodeURIComponent(file)}`)
 }
+
+/**
+ * 删除任务记录。
+ * purge=true 时同时删除磁盘数据（Data 目录与 config_test 参数存档），不可恢复。
+ */
+export function deleteJob(
+  id: string,
+  purge: boolean,
+): Promise<{
+  code: number
+  jobId: string
+  removedFromMemory: boolean
+  purged: boolean
+  message: string
+}> {
+  return request(
+    'DELETE',
+    `/jobs/${encodeURIComponent(id)}/record?purge=${purge ? 'true' : 'false'}`,
+  )
+}

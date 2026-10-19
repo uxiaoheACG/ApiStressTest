@@ -10,6 +10,7 @@ import Sparkline from '../components/Sparkline.vue'
 import {
   ApiError,
   cancelJob,
+  deleteJob,
   getAnalysis,
   getJob,
   getJobConfig,
@@ -75,6 +76,12 @@ const analysisLoading = ref(false)
 const analysisError = ref('')
 const sample = ref<SampleFile | null>(null)
 const sampleLoading = ref(false)
+
+/** 删除任务记录 */
+const showDeleteConfirm = ref(false)
+const purgeData = ref(true)
+const deleting = ref(false)
+const deleteError = ref('')
 
 let pollTimer: number | undefined
 
@@ -322,6 +329,22 @@ async function handleCancel() {
   }
 }
 
+/** 确认删除任务记录（可选连同本地数据） */
+async function confirmDelete() {
+  deleting.value = true
+  deleteError.value = ''
+  try {
+    await deleteJob(jobId.value, purgeData.value)
+    showDeleteConfirm.value = false
+    stopPolling()
+    await router.replace('/dashboard')
+  } catch (err) {
+    deleteError.value = err instanceof ApiError ? err.message : (err as Error).message
+  } finally {
+    deleting.value = false
+  }
+}
+
 function prevPage() {
   if (page.value > 0) page.value -= 1
 }
@@ -400,6 +423,7 @@ onUnmounted(stopPolling)
             {{ cancelling ? '取消中…' : '取消任务' }}
           </button>
           <RouterLink to="/dashboard" class="btn btn-sm">返回监控</RouterLink>
+          <button class="btn btn-danger btn-sm" @click="showDeleteConfirm = true">删除</button>
         </div>
       </div>
 
@@ -788,8 +812,78 @@ onUnmounted(stopPolling)
       </div>
     </section>
 
+    <!-- 样本快照（samples/ 目录） -->
+    <section class="card">
+      <div class="card-head">
+        <h2>样本快照</h2>
+        <span class="hint">samples/ 目录：每种返回类型只保留第一份完整快照</span>
+      </div>
+
+      <div v-if="analysisLoading" class="empty">
+        <span class="spin" /> 加载中…
+      </div>
+
+      <div v-else-if="!analysisReport || analysisReport.types.length === 0" class="empty">
+        <strong>没有样本文件</strong>
+        旧版本任务不产生样本；新任务的样本会在某种返回首次出现时写入 samples/ 目录。
+      </div>
+
+      <div v-else class="card-body sample-grid">
+        <button
+          v-for="item in analysisReport.types"
+          :key="item.fingerprint"
+          class="sample-card"
+          :disabled="!item.sampleFile"
+          @click="viewSample(item.sampleFile)"
+        >
+          <div class="sample-card-head">
+            <span :class="codeClass(item.statusCode)">{{ item.statusCode || '—' }}</span>
+            <span v-if="item.bizCode && item.bizCode !== 'none'" class="chip">{{ item.bizCode }}</span>
+            <span :class="kindBadge(item.kind)">{{ failureKindText(item.kind) }}</span>
+          </div>
+          <div class="sample-file mono-sm">{{ item.sampleFile || '（无样本文件）' }}</div>
+          <div class="sample-meta dim">
+            命中 {{ formatNumber(item.count) }} 次 · 首次 {{ formatClock(item.firstSeenAt) }}
+          </div>
+        </button>
+      </div>
+    </section>
+
     <RecordDetail :line="selected" @close="selected = null" />
     <SampleDrawer :sample="sample" @close="sample = null" />
+
+    <!-- 删除确认 -->
+    <Teleport to="body">
+      <div v-if="showDeleteConfirm" class="modal-mask" @click.self="showDeleteConfirm = false">
+        <div class="modal">
+          <h3>删除任务 {{ jobId }}</h3>
+          <p class="muted">
+            将从任务列表移除该任务；勾选下面的选项会同时删除磁盘上的结果数据。
+          </p>
+
+          <div v-if="deleteError" class="banner banner-err">
+            <span>⚠️</span><span>{{ deleteError }}</span>
+          </div>
+
+          <label class="purge-option">
+            <input v-model="purgeData" type="checkbox" />
+            <span>
+              同时删除本地存储数据（Data 目录、config_test 参数存档）
+              <em>删除后不可恢复</em>
+            </span>
+          </label>
+
+          <div class="modal-actions">
+            <button class="btn" :disabled="deleting" @click="showDeleteConfirm = false">
+              取消
+            </button>
+            <button class="btn btn-danger" :disabled="deleting" @click="confirmDelete">
+              {{ deleting ? '删除中…' : '确认删除' }}
+            </button>
+          </div>
+        </div>
+      </div>
+    </Teleport>
   </div>
 </template>
 
@@ -847,5 +941,114 @@ onUnmounted(stopPolling)
   min-width: 44px;
   text-align: right;
   font-variant-numeric: tabular-nums;
+}
+
+.sample-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 10px;
+}
+
+.sample-card {
+  text-align: left;
+  padding: 11px 13px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.03);
+  color: inherit;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.sample-card:hover:not(:disabled) {
+  border-color: rgba(56, 189, 248, 0.4);
+  background: rgba(56, 189, 248, 0.08);
+}
+
+.sample-card:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.sample-card-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+
+.sample-file {
+  color: var(--muted);
+  word-break: break-all;
+  font-size: 11.5px;
+}
+
+.sample-meta {
+  font-size: 11px;
+}
+
+.modal-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(4, 8, 16, 0.66);
+  backdrop-filter: blur(2px);
+  z-index: 60;
+  display: grid;
+  place-items: center;
+}
+
+.modal {
+  width: min(440px, 92vw);
+  background: #0c1524;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.modal h3 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.modal p {
+  margin: 0;
+  font-size: 12.5px;
+}
+
+.purge-option {
+  display: flex;
+  gap: 9px;
+  align-items: flex-start;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.03);
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.purge-option input {
+  margin-top: 3px;
+  accent-color: var(--err);
+}
+
+.purge-option em {
+  display: block;
+  font-style: normal;
+  font-size: 11px;
+  color: var(--err);
+  margin-top: 2px;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
 }
 </style>
