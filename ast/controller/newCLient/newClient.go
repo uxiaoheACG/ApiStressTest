@@ -10,7 +10,7 @@ func NewClient(config model.ConcurrencyConfig) *http.Client {
 	transport := &http.Transport{
 		MaxIdleConns:        2 * config.Count, //最多闲置
 		MaxIdleConnsPerHost: config.Count,     //最多并发
-		MaxConnsPerHost:     1500,
+		MaxConnsPerHost:     10000,
 		IdleConnTimeout:     60 * time.Second, //一个连接超过60s不用就回收
 	}
 

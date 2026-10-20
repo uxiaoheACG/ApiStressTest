@@ -1,6 +1,6 @@
 {
   "name": "ast-stress-desktop",
-  "version": "1.3.1",
+  "version": "1.3.21",
   "private": true,
   "description": "API-STRESS-TEST 桌面端：ast 压测后端的图形界面",
   "author": "API-STRESS-TEST",
@@ -33,6 +33,7 @@
   "build": {
     "appId": "com.ast.stress.test",
     "productName": "AST压测台",
+    "electronDist": "node_modules/electron/dist",
     "directories": {
       "output": "release",
       "buildResources": "resources"
